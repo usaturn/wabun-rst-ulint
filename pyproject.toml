@@ -34,6 +34,9 @@ default-groups = ["dev"]
 [tool.pytest.ini_options]
 # Allow `import tests.inline_corpus` / `import tests.helpers` for S1 corpus modules.
 pythonpath = ["."]
+# public サブモジュール内のミラー(public/tests 等)を収集対象から除外する。
+# 公開側には tools が存在しないが、存在しない testpaths エントリは無視される。
+testpaths = ["tests", "tools/public_sync/tests"]
 
 
 [tool.ruff]
