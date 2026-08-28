@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          # 空白エラー検査が base..HEAD の range を解決できるよう全履歴を取得する
+          fetch-depth: 0
+      - name: Set up uv and Python 3.14
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: "3.14"
+          enable-cache: true
+          cache-python: true
+      - name: Verify imported docutils version
+        run: uv run --isolated --with 'docutils==0.22.4' --with 'pytest>=8' python -c 'import docutils; assert docutils.__version__ == "0.22.4"'
+      - name: Run full test suite
+        run: uv run --isolated --with 'docutils==0.22.4' --with 'pytest>=8' pytest -q
+      - name: Run Ruff checks
+        run: uvx ruff check src tests
+      - name: Verify Ruff formatting
+        run: uvx ruff format --check src tests
+      # checkout 直後の working tree は常に clean なので引数なしの `git diff --check` は
+      # 何も検査できない。PR が追加した行だけを base との merge-base 比較で検査する。
+      - name: Verify no whitespace errors in changed lines
+        if: github.event_name == 'pull_request'
+        run: git diff --check ${{ github.event.pull_request.base.sha }}...HEAD
