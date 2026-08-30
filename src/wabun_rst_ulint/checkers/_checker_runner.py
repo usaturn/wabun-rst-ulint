@@ -10,7 +10,7 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,7 +79,7 @@ def _restore_newlines(text: str, newline: str) -> str:
 
 
 def run_checker(
-    paths: list[str],
+    paths: Sequence[str | Path],
     *,
     fix: bool,
     process: Callable[[str], RunOutcome],
@@ -90,6 +90,8 @@ def run_checker(
     process には改行を LF へ正規化した文字列を渡す。fixed_text がある場合のみ、
     入力ファイルの改行種別へ戻してから書き込む。
     """
+    if isinstance(paths, (str, Path)):
+        raise TypeError("paths must be a sequence of path values, not a single str or Path")
     warnings: list[str] = []
     files = fileset.collect_rst_files([Path(p) for p in paths], warn=warnings.append)
     for message in warnings:

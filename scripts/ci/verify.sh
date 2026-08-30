@@ -6,8 +6,10 @@ cd "$repo_root"
 
 profile="${1:-full}"
 quality_targets=(src tests)
+pyright_targets=(src)
 if [[ -d tools/public_sync ]]; then
   quality_targets+=(tools)
+  pyright_targets+=(tools)
 fi
 uv lock --check
 uv sync --locked --all-groups
@@ -18,6 +20,7 @@ case "$profile" in
     uv run --no-sync pytest -v
     uv run --no-sync ruff format --check "${quality_targets[@]}"
     uv run --no-sync ruff check "${quality_targets[@]}"
+    uv run --no-sync pyright "${pyright_targets[@]}"
     uv build --out-dir dist --clear
     uvx twine check --strict dist/*
     ;;

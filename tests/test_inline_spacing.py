@@ -896,6 +896,14 @@ class TestCheckerRunner:
         assert seen == ["before\nafter\n"]
         assert rst.read_bytes() == b"fixed\r\nafter\r\n"
 
+    def test_rejects_single_string_path(self):
+        with pytest.raises(TypeError, match="paths"):
+            _checker_runner.run_checker(
+                "a.rst",
+                fix=True,
+                process=lambda text: _checker_runner.RunOutcome(violations=()),
+            )
+
 
 class TestRun:
     def test_check_mode_end_to_end(self, tmp_path):

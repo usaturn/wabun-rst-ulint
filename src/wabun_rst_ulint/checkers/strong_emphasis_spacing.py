@@ -18,6 +18,7 @@ sphinx(docutils) の強調表示はダブルアスタリスクの外側に
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -104,7 +105,7 @@ def _analyze(text: str) -> StrongEditPlan:
     return build_edit_plan(text, views.strong.owners)
 
 
-def run(paths: list[str | Path], *, fix: bool) -> int:
+def run(paths: Sequence[str | Path], *, fix: bool) -> int:
     """Typed StrongView consumer を共通 runner で検査・修正する。"""
 
     def process(text: str) -> _checker_runner.RunOutcome:

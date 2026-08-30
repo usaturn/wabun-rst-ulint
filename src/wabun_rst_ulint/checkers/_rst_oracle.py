@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import bisect
 import re
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from io import StringIO
@@ -213,7 +213,7 @@ def scoped_opaque_roles(*role_names: str) -> Iterator[None]:
         if key in seen:
             continue
         seen.add(key)
-        previous[key] = roles._roles.get(key)  # type: ignore[attr-defined]
+        previous[key] = roles._roles.get(key)  # pyright: ignore[reportAttributeAccessIssue]
 
         def _make_role(role_name: str):
             def _role(
@@ -222,8 +222,8 @@ def scoped_opaque_roles(*role_names: str) -> Iterator[None]:
                 text: str,
                 lineno: int,
                 inliner: Any,
-                options: dict[str, Any] | None = None,
-                content: list[str] | None = None,
+                options: Mapping[str, Any] | None = None,
+                content: Sequence[str] | None = None,
             ) -> tuple[list[nodes.Node], list[nodes.system_message]]:
                 del role, lineno, inliner, options, content
                 node = nodes.inline(rawtext, nodes.unescape(text))
@@ -232,18 +232,20 @@ def scoped_opaque_roles(*role_names: str) -> Iterator[None]:
 
             return _role
 
-        roles.register_local_role(key, _make_role(key))
+        # typeshed の _RoleFn は戻り値を Sequence[reference] 二本と誤記している。
+        # 実 API は (list[Node], list[system_message]) であり、一致させられない。
+        roles.register_local_role(key, _make_role(key))  # pyright: ignore[reportArgumentType]
     try:
         yield
     finally:
         for key, prior in previous.items():
             if prior is None:
-                roles._roles.pop(key, None)  # type: ignore[attr-defined]
+                roles._roles.pop(key, None)  # pyright: ignore[reportAttributeAccessIssue]
             else:
-                roles._roles[key] = prior  # type: ignore[attr-defined]
+                roles._roles[key] = prior  # pyright: ignore[reportAttributeAccessIssue]
 
 
-def _inline_kind(node: nodes.Node) -> str:
+def _inline_kind(node: nodes.Element) -> str:
     if isinstance(node, nodes.inline):
         classes = list(node.get("classes") or [])
         if "opaque-role" in classes or "opaque_role" in classes:
@@ -265,7 +267,11 @@ def _has_literal_block_ancestor(node: nodes.Node) -> bool:
 def _extract_inlines(document: nodes.document) -> tuple[OracleInline, ...]:
     out: list[OracleInline] = []
     for node in document.findall():
-        if isinstance(node, nodes.Text) or node.tagname == "document":
+        if isinstance(node, nodes.Text):
+            continue
+        if not isinstance(node, nodes.Element):
+            continue
+        if node.tagname == "document":
             continue
         if _has_literal_block_ancestor(node):
             continue
@@ -556,4 +562,4 @@ def range_in_opaque(start: int, end: int, opaque: Sequence[tuple[int, int]]) -> 
 
 def role_registry_has(name: str) -> bool:
     """Test helper: whether *name* is currently in the local role registry."""
-    return name.lower() in roles._roles  # type: ignore[attr-defined]
+    return name.lower() in roles._roles  # pyright: ignore[reportAttributeAccessIssue]

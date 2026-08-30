@@ -296,17 +296,13 @@ def run(paths: list[Path], *, fix: bool, follow_symlinks: bool = False) -> int:
             exit_code = 2
             continue
 
-        try:
-            if fix:
-                fixed = fix_text(text)
-            else:
-                violations = find_violations(text)
-        except Exception as exc:
-            print(f"分類失敗: {path}: {exc}", file=sys.stderr)
-            exit_code = 2
-            continue
-
         if fix:
+            try:
+                fixed = fix_text(text)
+            except Exception as exc:
+                print(f"分類失敗: {path}: {exc}", file=sys.stderr)
+                exit_code = 2
+                continue
             if fixed != text:
                 try:
                     path.write_text(fixed, encoding="utf-8")
@@ -316,6 +312,12 @@ def run(paths: list[Path], *, fix: bool, follow_symlinks: bool = False) -> int:
                     continue
                 print(f"修正: {path}")
         else:
+            try:
+                violations = find_violations(text)
+            except Exception as exc:
+                print(f"分類失敗: {path}: {exc}", file=sys.stderr)
+                exit_code = 2
+                continue
             total += len(violations)
             for violation in violations:
                 print(f"{path}:{violation.line}: [{violation.kind}] {violation.text.strip()}")

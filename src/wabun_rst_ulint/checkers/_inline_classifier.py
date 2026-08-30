@@ -1154,7 +1154,7 @@ def classify_document(source: str) -> ConsumerViews:
         decisions.append(
             EditDecision(
                 candidate=candidate,
-                status=status,  # type: ignore[arg-type]
+                status=status,
                 reason=raw.reason,
             )
         )

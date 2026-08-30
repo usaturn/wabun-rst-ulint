@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from docutils import nodes
 
@@ -353,7 +355,7 @@ def _document_fingerprint_from_oracle(
     blocks = tuple(
         node.tagname
         for node in document.findall()
-        if node.tagname in _BLOCK_TAGS and not _has_system_message_ancestor(node)
+        if isinstance(node, nodes.Element) and node.tagname in _BLOCK_TAGS and not _has_system_message_ancestor(node)
     )
     return DocumentFingerprint(
         untouched_inlines=untouched,
@@ -706,7 +708,7 @@ def fix_document(source: str) -> FixResult:
 # --- CLI 未配線のエントリポイント（配線は #14） ---
 
 
-def run(paths: list[str], *, fix: bool) -> int:
+def run(paths: Sequence[str | Path], *, fix: bool) -> int:
     """`_checker_runner` を使って対象ファイル群を検査・修正する。"""
 
     def process(text: str) -> _checker_runner.RunOutcome:
