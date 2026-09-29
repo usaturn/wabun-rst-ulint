@@ -5,6 +5,7 @@ on:
     branches:
       - main
   pull_request:
+  pull_request_target:
   workflow_dispatch:
 
 permissions:
@@ -12,6 +13,9 @@ permissions:
 
 jobs:
   release-gate:
+    # pull_request_target は下の secret-scan 専用のイベントである。
+    # PR のコードを実行するこのジョブは、そのイベントでは動かさない。
+    if: github.event_name != 'pull_request_target'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -38,3 +42,103 @@ jobs:
       - name: Verify no whitespace errors in changed lines
         if: github.event_name == 'pull_request'
         run: git diff --check ${{ github.event.pull_request.base.sha }}...HEAD
+      - name: Run full verification profile
+        run: ./scripts/ci/verify.sh full
+
+  secret-scan:
+    # pull_request_target で実行するため、ワークフローと .gitleaks.toml は常に base ブランチのものを使う。
+    # PR はルールを緩めることも、このジョブを削除することもできない。
+    # PR の head コミットは git オブジェクトとして fetch して検査するだけで、checkout も実行もしない。
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out base repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # pull_request_target: イベントが固定した base コミット
+          # push / workflow_dispatch: イベントのコミット
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_ARCHIVE_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          archive="$tmp/gitleaks.tar.gz"
+          curl -fL -o "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          printf '%s  %s\n' "$GITLEAKS_ARCHIVE_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$tmp" gitleaks
+          sudo install -m 0755 "$tmp/gitleaks" /usr/local/bin/gitleaks
+      - name: Scan for secrets
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # 環境変数から検査ルールを差し替えられないようにする。gitleaks は --config、
+          # これらの環境変数、検査対象ツリーの .gitleaks.toml の順に設定を探す。
+          unset GITLEAKS_CONFIG GITLEAKS_CONFIG_TOML
+          if [[ ! -f "$GITHUB_WORKSPACE/.gitleaks.toml" ]]; then
+            echo "error: base-owned .gitleaks.toml is missing" >&2
+            exit 1
+          fi
+
+          log_opts=""
+          case "$EVENT_NAME" in
+            pull_request_target)
+              if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]] \
+                || [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+                || [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "error: malformed pull_request_target event fields" >&2
+                exit 1
+              fi
+              checked_out="$(git rev-parse HEAD)"
+              if [[ "$checked_out" != "$BASE_SHA" ]]; then
+                echo "error: checked-out base $checked_out != event base.sha $BASE_SHA" >&2
+                exit 1
+              fi
+              # 実行待ちの間に pull ref の先端が動くことがあるため、イベントが固定した
+              # コミットだけを検査する。取得できなければ git の失敗で停止する。
+              git fetch --no-tags origin "refs/pull/$PR_NUMBER/head"
+              fetched="$(git rev-parse FETCH_HEAD)"
+              if [[ "$fetched" != "$HEAD_SHA" ]]; then
+                echo "error: fetched pull/$PR_NUMBER/head $fetched != event head.sha $HEAD_SHA" >&2
+                exit 1
+              fi
+              merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+              log_opts="$merge_base..$HEAD_SHA"
+              ;;
+            push)
+              checked_out="$(git rev-parse HEAD)"
+              if [[ "$checked_out" != "$PUSH_AFTER" ]]; then
+                echo "error: checked-out $checked_out != event sha $PUSH_AFTER" >&2
+                exit 1
+              fi
+              if [[ "$PUSH_BEFORE" =~ ^[0-9a-f]{40}$ ]] \
+                && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+                log_opts="$PUSH_BEFORE..$PUSH_AFTER"
+              else
+                # 新規ブランチや履歴が欠けている場合は、省略せず全履歴を検査する
+                log_opts=""
+              fi
+              ;;
+            *)
+              log_opts=""
+              ;;
+          esac
+
+          if [[ -n "$log_opts" ]]; then
+            gitleaks git --redact --no-banner --config "$GITHUB_WORKSPACE/.gitleaks.toml" --ignore-gitleaks-allow --log-opts="$log_opts" .
+          else
+            gitleaks git --redact --no-banner --config "$GITHUB_WORKSPACE/.gitleaks.toml" --ignore-gitleaks-allow .
+          fi

@@ -1,0 +1,7 @@
+# 公開側 CI の secret-scan ジョブが base ブランチから読み込む Gitleaks 設定。
+# PR 側から緩められないよう、ワークフローは常に base の本ファイルを --config で渡す。
+# 組み込みルールをそのまま使い、allowlist は追加しない。
+title = "wabun-rst-ulint public"
+
+[extend]
+useDefault = true
