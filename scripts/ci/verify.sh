@@ -7,10 +7,6 @@ cd "$repo_root"
 profile="${1:-full}"
 quality_targets=(src tests)
 pyright_targets=(src)
-if [[ -d tools/public_sync ]]; then
-  quality_targets+=(tools)
-  pyright_targets+=(tools)
-fi
 uv lock --check
 uv sync --locked --all-groups
 
