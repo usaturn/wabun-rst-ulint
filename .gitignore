@@ -14,3 +14,5 @@ docs/_build/
 .DS_Store
 .idea/
 .vscode/
+# 開発環境の pr-review スキルが保存するレビュー結果
+reviews/
