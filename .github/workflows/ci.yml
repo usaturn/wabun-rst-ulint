@@ -93,6 +93,14 @@ jobs:
             exit 1
           fi
 
+          # gitleaks git は git log -p -U0 の出力を検査する。--log-opts を渡すと、その値を空白で
+          # 分割して git log に渡し、既定の引数を足さない。渡さないと
+          # --full-history --all --diff-filter=tuxdb を渡す（Gitleaks 8.30.1 の debug 出力で確認）。
+          # git log -p は既定でマージ commit の差分を出さないので、競合の解消やマージで初めて入った
+          # 内容を見逃す。どの経路でも -m を付けて、マージ commit を親との差分として出させる。
+          # -m の形式は log.diffMerges に従い、runner の Git の既定（separate）ではそれぞれの親との
+          # 差分になる。全履歴は Gitleaks の既定の引数に -m を足したもの
+          full_history="--full-history --all --diff-filter=tuxdb -m"
           log_opts=""
           case "$EVENT_NAME" in
             pull_request_target)
@@ -116,7 +124,7 @@ jobs:
                 exit 1
               fi
               merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
-              log_opts="$merge_base..$HEAD_SHA"
+              log_opts="-m $merge_base..$HEAD_SHA"
               ;;
             push)
               checked_out="$(git rev-parse HEAD)"
@@ -126,19 +134,16 @@ jobs:
               fi
               if [[ "$PUSH_BEFORE" =~ ^[0-9a-f]{40}$ ]] \
                 && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
-                log_opts="$PUSH_BEFORE..$PUSH_AFTER"
+                log_opts="-m $PUSH_BEFORE..$PUSH_AFTER"
               else
-                # 新規ブランチや履歴が欠けている場合は、省略せず全履歴を検査する
-                log_opts=""
+                # 新規ブランチや履歴が欠けている場合は、省略せず全履歴（マージ commit の差分を含む）を検査する
+                log_opts="$full_history"
               fi
               ;;
             *)
-              log_opts=""
+              # workflow_dispatch: 全履歴（マージ commit の差分を含む）を検査する
+              log_opts="$full_history"
               ;;
           esac
 
-          if [[ -n "$log_opts" ]]; then
-            gitleaks git --redact --no-banner --config "$GITHUB_WORKSPACE/.gitleaks.toml" --ignore-gitleaks-allow --log-opts="$log_opts" .
-          else
-            gitleaks git --redact --no-banner --config "$GITHUB_WORKSPACE/.gitleaks.toml" --ignore-gitleaks-allow .
-          fi
+          gitleaks git --redact --no-banner --config "$GITHUB_WORKSPACE/.gitleaks.toml" --ignore-gitleaks-allow --log-opts="$log_opts" .
