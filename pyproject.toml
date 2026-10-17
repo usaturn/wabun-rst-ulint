@@ -1,6 +1,6 @@
 [project]
 name = "wabun-rst-ulint"
-version = "0.0.1"
+version = "0.0.2"
 description = "reStructuredText の検査・修正 CLI ツール"
 readme = "README.rst"
 requires-python = ">=3.14"
