@@ -21,7 +21,12 @@ from pathlib import Path
 from docutils import nodes
 
 from wabun_rst_ulint.checkers import _checker_runner
-from wabun_rst_ulint.checkers._inline_classifier import classify_document
+from wabun_rst_ulint.checkers._inline_classifier import (
+    UNRECOGNIZED_END,
+    UNRECOGNIZED_START,
+    UNRECOGNIZED_START_END,
+    classify_document,
+)
 from wabun_rst_ulint.checkers._inline_model import EditDecision
 from wabun_rst_ulint.checkers._rst_oracle import (
     AlignedInline,
@@ -584,8 +589,24 @@ def prove_combined_projection(baseline: DocumentFingerprint, projected: Document
 # --- Check / Fix オーケストレーション ---
 
 
+# report_only decision の reason → (表示する位置, 抜き出しに含める前後の文字数)
+_UNRECOGNIZED_SIDES = {
+    UNRECOGNIZED_START: ("開始記号の前", 1, 0),
+    UNRECOGNIZED_END: ("終了記号の後", 0, 1),
+    UNRECOGNIZED_START_END: ("開始記号の前と終了記号の後", 1, 1),
+}
+
+
 def _decision_violation(source: str, decision: EditDecision) -> Violation:
     candidate = decision.candidate
+    if decision.status == "report_only":
+        side, before, after = _UNRECOGNIZED_SIDES[decision.reason]
+        excerpt = source[candidate.source_range.start - before : candidate.source_range.end + after]
+        return Violation(
+            line=candidate.source_range.line,
+            kind=candidate.form,
+            text=f"{candidate.form} の外部境界を docutils が認識しない（{side}: {excerpt!r}、--fix では修正しない）",
+        )
     current = source[candidate.source_range.start : candidate.source_range.end]
     return Violation(
         line=candidate.source_range.line,
@@ -612,11 +633,15 @@ class FixResult:
     diagnostic: str | None = None
 
 
-def check_document(source: str) -> CheckResult:
-    """source を検査し、accepted decision のみを violation として報告する。"""
-    views = classify_document(source)
-    accepted = accepted_decisions(views.inline.decisions)
-    return CheckResult(violations=tuple(_decision_violation(source, d) for d in accepted))
+def check_document(source: str, *, syntax_only: bool = False) -> CheckResult:
+    """source を検査し、accepted と report_only の decision を violation として報告する。
+
+    syntax_only=True は、docutils が記法の境界と認識できない箇所だけを違反にする
+    規則（Issue #2）。既定の規則では report_only の decision は生じない。
+    """
+    views = classify_document(source, syntax_only=syntax_only)
+    reported = tuple(d for d in views.inline.decisions if d.status in ("accepted", "report_only"))
+    return CheckResult(violations=tuple(_decision_violation(source, d) for d in reported))
 
 
 def fix_document(source: str) -> FixResult:
