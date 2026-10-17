@@ -8,6 +8,7 @@ S2 (`_inline_classifier.classify_document`) の `InlineView` だけを消費し�
 
     uv run wabun-rst-ulint inline-spacing docs/
     uv run wabun-rst-ulint inline-spacing --fix docs/
+    uv run wabun-rst-ulint inline-spacing --syntax-only docs/
 """
 
 from __future__ import annotations
@@ -15,20 +16,26 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from docutils import nodes
 
 from wabun_rst_ulint.checkers import _checker_runner
-from wabun_rst_ulint.checkers._inline_classifier import classify_document
-from wabun_rst_ulint.checkers._inline_model import EditDecision
+from wabun_rst_ulint.checkers._inline_classifier import (
+    UNRECOGNIZED_END,
+    UNRECOGNIZED_START,
+    UNRECOGNIZED_START_END,
+    classify_document,
+)
+from wabun_rst_ulint.checkers._inline_model import ConsumerViews, EditDecision
 from wabun_rst_ulint.checkers._rst_oracle import (
     AlignedInline,
     OracleDocument,
     OracleInline,
     align_inlines_with_status,
     parse_document,
+    split_alignable_inlines,
 )
 from wabun_rst_ulint.reporting import Violation
 
@@ -170,23 +177,8 @@ def _inline_key(item: OracleInline | AlignedInline) -> InlineKey:
 def _inline_proof_inputs(
     inlines: tuple[OracleInline, ...],
 ) -> tuple[tuple[OracleInline, ...], tuple[InlineKey, ...]]:
-    alignable: list[OracleInline] = []
-    image_semantics: list[InlineKey] = []
-    previous: OracleInline | None = None
-    for item in inlines:
-        embedded_target = (
-            item.kind == "target"
-            and previous is not None
-            and previous.kind == "reference"
-            and bool(item.rawsource)
-            and item.rawsource in previous.rawsource
-        )
-        if item.kind == "image":
-            image_semantics.append(_inline_key(item))
-        elif not embedded_target:
-            alignable.append(item)
-        previous = item
-    return tuple(alignable), tuple(image_semantics)
+    alignable, images = split_alignable_inlines(inlines)
+    return alignable, tuple(_inline_key(item) for item in images)
 
 
 def _touches_ranges(
@@ -561,14 +553,34 @@ class ProofResult:
     reason: str | None = None
 
 
-def prove_combined_projection(baseline: DocumentFingerprint, projected: DocumentFingerprint) -> ProofResult:
+def _without_problematic(inlines: tuple[InlineKey, ...]) -> tuple[InlineKey, ...]:
+    return tuple(key for key in inlines if key[0] != "problematic")
+
+
+def prove_combined_projection(
+    baseline: DocumentFingerprint,
+    projected: DocumentFingerprint,
+    *,
+    ignore_problematic: bool = False,
+) -> ProofResult:
     """baseline/projected の untouched inline 列・block 列・message Counter を比較する純粋な証明関数。
 
     Safety transaction の (3)(4)(5)(6) に対応する。
+
+    ignore_problematic=True は、untouched inline の比較から problematic を除く
+    （syntax-only の修正用）。直さずに残す境界の problematic は rawsource が
+    バッククォート 1〜2 個と短く、baseline では手前の直す記法の未認識の
+    バッククォートへ整列して比較から外れ、projected では本来の位置に残るため。
+    problematic は必ず system message を伴うので、増えた場合は message の比較が拒否する。
     """
     if baseline.truncated_from_line is not None or projected.truncated_from_line is not None:
         return ProofResult(ok=False, reason="inline alignment truncated; cannot prove safety, failing closed")
-    if projected.untouched_inlines != baseline.untouched_inlines:
+    baseline_inlines = baseline.untouched_inlines
+    projected_inlines = projected.untouched_inlines
+    if ignore_problematic:
+        baseline_inlines = _without_problematic(baseline_inlines)
+        projected_inlines = _without_problematic(projected_inlines)
+    if projected_inlines != baseline_inlines:
         return ProofResult(
             ok=False,
             reason="untouched inline markup changed (payload/delimiter/adjacent node not preserved)",
@@ -584,8 +596,24 @@ def prove_combined_projection(baseline: DocumentFingerprint, projected: Document
 # --- Check / Fix オーケストレーション ---
 
 
+# report_only decision の reason → (表示する位置, 抜き出しに含める前後の文字数)
+_UNRECOGNIZED_SIDES = {
+    UNRECOGNIZED_START: ("開始記号の前", 1, 0),
+    UNRECOGNIZED_END: ("終了記号の後", 0, 1),
+    UNRECOGNIZED_START_END: ("開始記号の前と終了記号の後", 1, 1),
+}
+
+
 def _decision_violation(source: str, decision: EditDecision) -> Violation:
     candidate = decision.candidate
+    if decision.status == "report_only":
+        side, before, after = _UNRECOGNIZED_SIDES[decision.reason]
+        excerpt = source[candidate.source_range.start - before : candidate.source_range.end + after]
+        return Violation(
+            line=candidate.source_range.line,
+            kind=candidate.form,
+            text=f"{candidate.form} の外部境界を docutils が認識しない（{side}: {excerpt!r}、--fix では修正しない）",
+        )
     current = source[candidate.source_range.start : candidate.source_range.end]
     return Violation(
         line=candidate.source_range.line,
@@ -603,25 +631,56 @@ class CheckResult:
 
 @dataclass(frozen=True)
 class FixResult:
-    """fix_document() の結果。transaction_failure=True の場合 text は入力と同一。"""
+    """fix_document() の結果。transaction_failure=True の場合 text は入力と同一。
+
+    remaining は syntax_only=True の場合だけ使う、修正後もなお残る違反。
+    """
 
     text: str
     changed: bool
     violations: tuple[Violation, ...]
     transaction_failure: bool
     diagnostic: str | None = None
+    remaining: tuple[Violation, ...] = ()
 
 
-def check_document(source: str) -> CheckResult:
-    """source を検査し、accepted decision のみを violation として報告する。"""
-    views = classify_document(source)
-    accepted = accepted_decisions(views.inline.decisions)
-    return CheckResult(violations=tuple(_decision_violation(source, d) for d in accepted))
+def check_document(source: str, *, syntax_only: bool = False) -> CheckResult:
+    """source を検査し、accepted と report_only の decision を violation として報告する。
+
+    syntax_only=True は、docutils が記法の境界と認識できない箇所だけを違反にする
+    規則（Issue #2）。既定の規則では report_only の decision は生じない。
+    """
+    views = classify_document(source, syntax_only=syntax_only)
+    reported = tuple(d for d in views.inline.decisions if d.status in ("accepted", "report_only"))
+    return CheckResult(violations=tuple(_decision_violation(source, d) for d in reported))
 
 
-def fix_document(source: str) -> FixResult:
-    """source を修正する。combined projection proof に失敗した場合は無変更で返す。"""
-    views = classify_document(source)  # parse #1（S2 の責務）
+def fix_document(source: str, *, syntax_only: bool = False) -> FixResult:
+    """source を修正する。combined projection proof に失敗した場合は無変更で返す。
+
+    syntax_only=True では、修正しない違反（report_only）を remaining に入れる。
+    修正は開始記号の前に空白を入れるだけで改行を足さないので、行番号はそのまま使える。
+    修正で後続の記法の解釈が変わる場合は combined projection proof が書き込みを
+    拒否するので、書き込んだ後も report_only の判定は変わらない。
+    """
+    views = classify_document(source, syntax_only=syntax_only)  # parse #1（S2 の責務）
+    result = _fix_accepted(source, views, syntax_only=syntax_only)
+    if not syntax_only:
+        return result
+    remaining = tuple(
+        _decision_violation(source, decision)
+        for decision in views.inline.decisions
+        if decision.status == "report_only"
+    )
+    return replace(result, remaining=remaining)
+
+
+def _fix_accepted(source: str, views: ConsumerViews, *, syntax_only: bool = False) -> FixResult:
+    """views の accepted decision を、安全確認を通してから source に適用する。
+
+    syntax_only=True では、report_only を書き換えずに残すので、combined projection
+    proof の untouched inline の比較から problematic を除く。
+    """
     accepted = accepted_decisions(views.inline.decisions)
     if not accepted:
         return FixResult(text=source, changed=False, violations=(), transaction_failure=False)
@@ -687,7 +746,7 @@ def fix_document(source: str) -> FixResult:
         edit_ranges=plan.projected_effect_ranges,
         message_aliases=message_aliases,
     )  # S3 combined projection parse（最大2回のうち2回目）
-    proof = prove_combined_projection(baseline_fp, projected_fp)
+    proof = prove_combined_projection(baseline_fp, projected_fp, ignore_problematic=syntax_only)
     if not proof.ok:
         return FixResult(
             text=source,
@@ -708,19 +767,20 @@ def fix_document(source: str) -> FixResult:
 # --- CLI 未配線のエントリポイント（配線は #14） ---
 
 
-def run(paths: Sequence[str | Path], *, fix: bool) -> int:
+def run(paths: Sequence[str | Path], *, fix: bool, syntax_only: bool = False) -> int:
     """`_checker_runner` を使って対象ファイル群を検査・修正する。"""
 
     def process(text: str) -> _checker_runner.RunOutcome:
         if fix:
-            result = fix_document(text)
+            result = fix_document(text, syntax_only=syntax_only)
             return _checker_runner.RunOutcome(
                 violations=result.violations,
                 fixed_text=result.text if result.changed else None,
                 transaction_failure=result.transaction_failure,
                 diagnostic=result.diagnostic,
+                remaining=result.remaining,
             )
-        result = check_document(text)
+        result = check_document(text, syntax_only=syntax_only)
         return _checker_runner.RunOutcome(violations=result.violations)
 
     return _checker_runner.run_checker(paths, fix=fix, process=process)

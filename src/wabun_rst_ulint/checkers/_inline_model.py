@@ -58,10 +58,14 @@ class StrongOwner:
 
 @dataclass(frozen=True)
 class EditDecision:
-    """Classifier decision for one repair candidate (no edit applied)."""
+    """Classifier decision for one repair candidate (no edit applied).
+
+    ``report_only`` (syntax-only rule, Issue #2) is a violation to report
+    without an edit; its ``reason`` names the unrecognized side.
+    """
 
     candidate: RepairCandidate
-    status: Literal["accepted", "rejected", "unsupported"]
+    status: Literal["accepted", "rejected", "unsupported", "report_only"]
     reason: str
 
 
