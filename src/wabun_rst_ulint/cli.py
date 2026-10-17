@@ -5,6 +5,7 @@ sentence-breaks）を argparse サブパーサで提供する。全サブコマ�
 --check / --fix は相互排他、フラグなし＝検査（--check と同義）。
 heading-width のみ --diff / --backup-suffix / --follow-symlinks を持つ
 （バリデーションは元スクリプトの parse_args と同一文言）。
+inline-spacing のみ --syntax-only を持つ（Issue #2）。
 sentence-breaks は --follow-symlinks を持ち、I/O エラー時は終了コード 2 を返す。
 """
 
@@ -46,6 +47,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_paths_argument(p, _DIR_HELP)
     _add_check_fix_group(p, fix_help="検出された外部境界スペースの不正を自動修正する")
+    p.add_argument(
+        "--syntax-only",
+        action="store_true",
+        help=(
+            "docutils が記法の境界として認識できない箇所だけを違反にする（日本語以外の文書向け）。"
+            "--fix では開始記号の前が文字・数字の場合だけ半角スペースを入れ、"
+            "直せない違反が残れば終了コード 1"
+        ),
+    )
 
     p = subparsers.add_parser(
         "strong-spacing",
@@ -125,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.subcommand == "inline-spacing":
         from wabun_rst_ulint.checkers import inline_spacing
 
-        return inline_spacing.run(args.paths, fix=args.fix)
+        return inline_spacing.run(args.paths, fix=args.fix, syntax_only=args.syntax_only)
     if args.subcommand == "strong-spacing":
         from wabun_rst_ulint.checkers import strong_emphasis_spacing
 

@@ -5,10 +5,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from wabun_rst_ulint.checkers import inline_spacing
 from wabun_rst_ulint.checkers._inline_classifier import classify_document
+from wabun_rst_ulint.cli import main
 
 _REPORTED = ("accepted", "report_only")
 
@@ -107,3 +110,66 @@ def test_report_only_message_names_the_side(source: str, detail: str):
     (violation,) = inline_spacing.check_document(source, syntax_only=True).violations
     assert violation.line == 1
     assert violation.text == f"literal の外部境界を docutils が認識しない（{detail}、--fix では修正しない）"
+
+
+@pytest.mark.parametrize(("source", "fixed"), FIXABLE)
+def test_fix_inserts_space_before_start(source: str, fixed: str):
+    result = inline_spacing.fix_document(source, syntax_only=True)
+    assert result.transaction_failure is False
+    assert result.text == fixed
+    assert result.remaining == ()
+    assert inline_spacing.fix_document(fixed, syntax_only=True).changed is False
+
+
+@pytest.mark.parametrize("source", REPORT_ONLY)
+def test_fix_leaves_report_only_boundaries(source: str):
+    result = inline_spacing.fix_document(source, syntax_only=True)
+    assert result.changed is False
+    assert result.transaction_failure is False
+    assert result.remaining == inline_spacing.check_document(source, syntax_only=True).violations
+
+
+def test_fix_keeps_report_only_violations_as_remaining():
+    source = "A the:ref:`roles` page.\n\nH see ``queue``value now.\n"
+    (fixable, report_only) = inline_spacing.check_document(source, syntax_only=True).violations
+    result = inline_spacing.fix_document(source, syntax_only=True)
+    assert result.text == "A the :ref:`roles` page.\n\nH see ``queue``value now.\n"
+    assert result.violations == (fixable,)
+    assert result.remaining == (report_only,)
+    assert inline_spacing.check_document(result.text, syntax_only=True).violations == (report_only,)
+
+
+def _write_rst(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "doc.rst"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_cli_english_text_passes_only_with_syntax_only(tmp_path: Path):
+    path = _write_rst(tmp_path, RECOGNIZED[0])
+    assert main(["inline-spacing", str(path)]) == 1
+    assert main(["inline-spacing", "--syntax-only", str(path)]) == 0
+    assert main(["inline-spacing", "--check", "--syntax-only", str(path)]) == 0
+
+
+def test_cli_fix_writes_fixable_and_reports_remaining(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    path = _write_rst(tmp_path, "A the:ref:`roles` page.\n\nH see ``queue``value now.\n")
+    assert main(["inline-spacing", "--fix", "--syntax-only", str(path)]) == 1
+    assert path.read_text(encoding="utf-8") == "A the :ref:`roles` page.\n\nH see ``queue``value now.\n"
+    err = capsys.readouterr().err
+    assert f"修正: {path}（1 箇所）" in err
+    assert f"{path}:3: literal の外部境界を docutils が認識しない" in err
+
+
+def test_cli_fix_report_only_file_is_unchanged_and_exits_1(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    path = _write_rst(tmp_path, REPORT_ONLY[1])
+    assert main(["inline-spacing", "--fix", "--syntax-only", str(path)]) == 1
+    assert path.read_text(encoding="utf-8") == REPORT_ONLY[1]
+    assert f"{path}:1: literal の外部境界を docutils が認識しない" in capsys.readouterr().err
+
+
+def test_cli_fix_all_fixable_exits_0(tmp_path: Path):
+    source, fixed = FIXABLE[0]
+    path = _write_rst(tmp_path, source)
+    assert main(["inline-spacing", "--fix", "--syntax-only", str(path)]) == 0
+    assert path.read_text(encoding="utf-8") == fixed

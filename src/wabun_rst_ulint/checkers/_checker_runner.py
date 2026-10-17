@@ -26,12 +26,15 @@ class RunOutcome:
     transaction_failure=True なら無書き込み・diagnostic 必須。
     fixed_text が非 None なら成功した変更として書き込む。
     fixed_text が None かつ transaction_failure=False なら変更なし。
+    remaining は fix モードで、書き込みの後も残る違反（自動修正しない違反）。
+    表示して終了コードを 1 にする。
     """
 
     violations: tuple[Violation, ...]
     fixed_text: str | None = None
     transaction_failure: bool = False
     diagnostic: str | None = None
+    remaining: tuple[Violation, ...] = ()
 
 
 def _atomic_write(filepath: Path, content: str) -> None:
@@ -86,7 +89,8 @@ def run_checker(
 ) -> int:
     """.rst ファイルを収集し、各ファイルに process() を適用して終了コードを返す。
 
-    終了コード: 対象0件=1 / I/Oエラー=1 / check違反あり=1 / fix成功=0 / transaction failure=1
+    終了コード: 対象0件=1 / I/Oエラー=1 / check違反あり=1 / fix成功=0 / transaction failure=1 /
+    fix 後に残った違反あり=1
     process には改行を LF へ正規化した文字列を渡す。fixed_text がある場合のみ、
     入力ファイルの改行種別へ戻してから書き込む。
     """
@@ -104,6 +108,7 @@ def run_checker(
     io_errors = 0
     violation_total = 0
     transaction_failures = 0
+    remaining_total = 0
 
     for path in files:
         try:
@@ -123,8 +128,7 @@ def run_checker(
                     print(f"{path}:{violation.line}: {violation.text}", file=sys.stderr)
                 print(f"修正失敗（変更なし）: {path}: {outcome.diagnostic}", file=sys.stderr)
                 transaction_failures += 1
-                continue
-            if outcome.fixed_text is not None:
+            elif outcome.fixed_text is not None:
                 try:
                     _atomic_write(path, _restore_newlines(outcome.fixed_text, newline))
                 except OSError as exc:
@@ -132,6 +136,9 @@ def run_checker(
                     io_errors += 1
                     continue
                 print(f"修正: {path}（{len(outcome.violations)} 箇所）", file=sys.stderr)
+            remaining_total += len(outcome.remaining)
+            for violation in outcome.remaining:
+                print(f"{path}:{violation.line}: {violation.text}", file=sys.stderr)
         else:
             if outcome.violations:
                 violation_total += len(outcome.violations)
@@ -141,5 +148,5 @@ def run_checker(
     if io_errors:
         return 1
     if fix:
-        return 1 if transaction_failures else 0
+        return 1 if transaction_failures or remaining_total else 0
     return 1 if violation_total else 0

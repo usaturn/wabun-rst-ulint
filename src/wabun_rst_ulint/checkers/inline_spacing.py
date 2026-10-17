@@ -8,6 +8,7 @@ S2 (`_inline_classifier.classify_document`) の `InlineView` だけを消費し�
 
     uv run wabun-rst-ulint inline-spacing docs/
     uv run wabun-rst-ulint inline-spacing --fix docs/
+    uv run wabun-rst-ulint inline-spacing --syntax-only docs/
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from docutils import nodes
@@ -27,7 +28,7 @@ from wabun_rst_ulint.checkers._inline_classifier import (
     UNRECOGNIZED_START_END,
     classify_document,
 )
-from wabun_rst_ulint.checkers._inline_model import EditDecision
+from wabun_rst_ulint.checkers._inline_model import ConsumerViews, EditDecision
 from wabun_rst_ulint.checkers._rst_oracle import (
     AlignedInline,
     OracleDocument,
@@ -624,13 +625,17 @@ class CheckResult:
 
 @dataclass(frozen=True)
 class FixResult:
-    """fix_document() の結果。transaction_failure=True の場合 text は入力と同一。"""
+    """fix_document() の結果。transaction_failure=True の場合 text は入力と同一。
+
+    remaining は syntax_only=True の場合だけ使う、修正後もなお残る違反。
+    """
 
     text: str
     changed: bool
     violations: tuple[Violation, ...]
     transaction_failure: bool
     diagnostic: str | None = None
+    remaining: tuple[Violation, ...] = ()
 
 
 def check_document(source: str, *, syntax_only: bool = False) -> CheckResult:
@@ -644,9 +649,28 @@ def check_document(source: str, *, syntax_only: bool = False) -> CheckResult:
     return CheckResult(violations=tuple(_decision_violation(source, d) for d in reported))
 
 
-def fix_document(source: str) -> FixResult:
-    """source を修正する。combined projection proof に失敗した場合は無変更で返す。"""
-    views = classify_document(source)  # parse #1（S2 の責務）
+def fix_document(source: str, *, syntax_only: bool = False) -> FixResult:
+    """source を修正する。combined projection proof に失敗した場合は無変更で返す。
+
+    syntax_only=True では、修正しない違反（report_only）を remaining に入れる。
+    修正は開始記号の前に空白を入れるだけで改行を足さないので、行番号はそのまま使える。
+    修正で後続の記法の解釈が変わる場合は combined projection proof が書き込みを
+    拒否するので、書き込んだ後も report_only の判定は変わらない。
+    """
+    views = classify_document(source, syntax_only=syntax_only)  # parse #1（S2 の責務）
+    result = _fix_accepted(source, views)
+    if not syntax_only:
+        return result
+    remaining = tuple(
+        _decision_violation(source, decision)
+        for decision in views.inline.decisions
+        if decision.status == "report_only"
+    )
+    return replace(result, remaining=remaining)
+
+
+def _fix_accepted(source: str, views: ConsumerViews) -> FixResult:
+    """views の accepted decision を、安全確認を通してから source に適用する。"""
     accepted = accepted_decisions(views.inline.decisions)
     if not accepted:
         return FixResult(text=source, changed=False, violations=(), transaction_failure=False)
@@ -733,19 +757,20 @@ def fix_document(source: str) -> FixResult:
 # --- CLI 未配線のエントリポイント（配線は #14） ---
 
 
-def run(paths: Sequence[str | Path], *, fix: bool) -> int:
+def run(paths: Sequence[str | Path], *, fix: bool, syntax_only: bool = False) -> int:
     """`_checker_runner` を使って対象ファイル群を検査・修正する。"""
 
     def process(text: str) -> _checker_runner.RunOutcome:
         if fix:
-            result = fix_document(text)
+            result = fix_document(text, syntax_only=syntax_only)
             return _checker_runner.RunOutcome(
                 violations=result.violations,
                 fixed_text=result.text if result.changed else None,
                 transaction_failure=result.transaction_failure,
                 diagnostic=result.diagnostic,
+                remaining=result.remaining,
             )
-        result = check_document(text)
+        result = check_document(text, syntax_only=syntax_only)
         return _checker_runner.RunOutcome(violations=result.violations)
 
     return _checker_runner.run_checker(paths, fix=fix, process=process)

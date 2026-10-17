@@ -557,7 +557,7 @@ class TestFixDocument:
             (),
             {"inline": type("FakeInlineView", (), {"decisions": decisions})()},
         )()
-        monkeypatch.setattr(inline_spacing, "classify_document", lambda _source: fake_views)
+        monkeypatch.setattr(inline_spacing, "classify_document", lambda _source, **_options: fake_views)
         result = inline_spacing.fix_document(source)
         assert result.transaction_failure is True
         assert result.changed is False

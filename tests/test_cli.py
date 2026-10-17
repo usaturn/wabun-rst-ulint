@@ -100,7 +100,13 @@ def test_inline_spacing_dispatches_to_inline_spacing_module(monkeypatch, rst: Pa
     seen = _record_run(monkeypatch, "inline_spacing")
     assert main(["inline-spacing", "--fix", str(rst)]) == 0
     assert seen["paths"] == [rst]
-    assert seen["kwargs"] == {"fix": True}
+    assert seen["kwargs"] == {"fix": True, "syntax_only": False}
+
+
+def test_inline_spacing_dispatches_syntax_only(monkeypatch, rst: Path):
+    seen = _record_run(monkeypatch, "inline_spacing")
+    assert main(["inline-spacing", "--check", "--syntax-only", str(rst)]) == 0
+    assert seen["kwargs"] == {"fix": False, "syntax_only": True}
 
 
 def test_strong_spacing_dispatches_to_strong_emphasis_spacing_module(monkeypatch, rst: Path):
