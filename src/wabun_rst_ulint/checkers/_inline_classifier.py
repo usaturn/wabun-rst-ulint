@@ -23,8 +23,8 @@ from wabun_rst_ulint.checkers._inline_model import (
     StrongView,
 )
 from wabun_rst_ulint.checkers._rst_oracle import (
-    AlignedInline,
     OracleCounters,
+    OracleInline,
     align_inlines_with_status,
     aligned_to_spans,
     make_source_range,
@@ -33,6 +33,7 @@ from wabun_rst_ulint.checkers._rst_oracle import (
     opaque_body_ranges,
     parse_document,
     range_in_opaque,
+    split_alignable_inlines,
 )
 
 # --- Lexical patterns for supported forms (narrow grammar) ---
@@ -148,10 +149,37 @@ _SYNTAX_END_OK_RE = re.compile(
     % (punctuation_chars.closing_delimiters, punctuation_chars.delimiters, punctuation_chars.closers)
 )
 
+# Last characters of explicit inline markup end-strings: literals, interpreted
+# text and roles (`), references (_), emphasis and strong (*), substitution
+# references (|). Only after one of them can a start-string be recognized by
+# directly following a recognized inline.
+_MARKUP_END_CHARS = frozenset("`_*|")
+# Explicit markup start of a comment: ".." then whitespace or the line end, not
+# a hyperlink target (.. _name: / .. __:), which docutils reports as an inline
+# node. Directive, footnote and substitution lines are told apart by
+# _is_comment_line_at, which alone also accepts "...text" paragraph lines.
+_COMMENT_START_RE = re.compile(r"[ \t]*\.\.(?:[ \t]+(?![ \t_])|[ \t]*(?:\n|$))")
+
 # Reasons of syntax-only report_only decisions: the side docutils cannot recognize.
 UNRECOGNIZED_START = "unrecognized-start"
 UNRECOGNIZED_END = "unrecognized-end"
 UNRECOGNIZED_START_END = "unrecognized-start-end"
+# Syntax-only unsupported reason: the start follows markup, but inline
+# alignment stopped before it, so whether that markup was recognized is unknown.
+ALIGNMENT_TRUNCATED = "alignment-truncated"
+
+
+@dataclass(frozen=True)
+class _InlineEnds:
+    """End offsets of explicit inline markup docutils recognized (syntax-only)."""
+
+    offsets: frozenset[int] = frozenset()
+    # Start of the line inline alignment stopped at; from there on an end
+    # missing from *offsets* may still belong to a recognized inline.
+    unknown_from: int | None = None
+
+
+_NO_INLINE_ENDS = _InlineEnds()
 
 
 @dataclass(frozen=True)
@@ -417,15 +445,21 @@ def _syntax_boundary_faults(
     source: str,
     start: int,
     end: int,
-    recognized_ends: frozenset[int],
-) -> tuple[bool, bool]:
+    recognized_ends: _InlineEnds,
+) -> tuple[bool | None, bool]:
     """Return whether docutils fails to recognize the start / end boundary.
 
     A start-string right after a docutils-recognized inline is recognized
     whatever the preceding character is: docutils resumes parsing there and
-    ``^`` satisfies start_string_prefix (``:ref:`a`:ref:`b```).
+    ``^`` satisfies start_string_prefix (``:ref:`a`:ref:`b```). The start
+    fault is None when that adjacency cannot be decided.
     """
-    start_fault = start > 0 and start not in recognized_ends and _SYNTAX_START_OK_RE.match(source, start - 1) is None
+    start_fault: bool | None = start > 0 and _SYNTAX_START_OK_RE.match(source, start - 1) is None
+    if start_fault and source[start - 1] in _MARKUP_END_CHARS:
+        if start in recognized_ends.offsets:
+            start_fault = False
+        elif recognized_ends.unknown_from is not None and start >= recognized_ends.unknown_from:
+            start_fault = None
     end_fault = end < len(source) and _SYNTAX_END_OK_RE.match(source, end) is None
     return start_fault, end_fault
 
@@ -437,19 +471,34 @@ def _syntax_only_candidate(
     *,
     form: str,
     raw: str,
-    recognized_ends: frozenset[int],
+    recognized_ends: _InlineEnds,
+    repairable: bool = True,
 ) -> _RawCandidate | None:
     """Syntax-only decision for one token; None when both boundaries are recognized.
 
     Only a missing space after a letter or digit before the start-string is
     repaired, and only when the end boundary is recognized: a start-side fix
     alone would leave the token unrecognized or pair it with a later
-    end-string. Everything else is reported without an edit.
+    end-string. Everything else is reported without an edit, and so is every
+    fault of a token that is not *repairable*. An undecidable start is not
+    reported; the end side is still judged on its own.
     """
     start_fault, end_fault = _syntax_boundary_faults(source, start, end, recognized_ends)
+    if start_fault is None and not end_fault:
+        return _RawCandidate(
+            start=start,
+            end=end,
+            form=form,
+            raw=raw,
+            edit_start=start,
+            edit_end=end,
+            expected_rawsource=raw,
+            status="unsupported",
+            reason=ALIGNMENT_TRUNCATED,
+        )
     if not start_fault and not end_fault:
         return None
-    if start_fault and not end_fault and unicodedata.category(source[start - 1])[0] in ("L", "N"):
+    if repairable and start_fault and not end_fault and unicodedata.category(source[start - 1])[0] in ("L", "N"):
         return _RawCandidate(
             start=start,
             end=end,
@@ -478,17 +527,48 @@ def _syntax_only_candidate(
     )
 
 
-def _recognized_inline_ends(aligned: list[AlignedInline]) -> frozenset[int]:
+def _recognized_inline_ends(
+    source: str,
+    inlines: tuple[OracleInline, ...],
+    opaque: list[tuple[int, int]],
+    *,
+    counters: OracleCounters,
+    newlines: list[int],
+) -> _InlineEnds:
     """End offsets of explicit inline markup docutils recognized.
 
-    Problematic nodes (short rawsource, unreliable alignment) and standalone
-    hyperlinks (recognized after the markup loop, so no ``^`` follows them;
-    their rawsource equals their text) are excluded.
+    Aligned on their own so that earlier content cannot shift or stop them:
+    embedded targets and images are left out (as in the fixer proof), and
+    matches inside opaque bodies and comment lines (literal blocks and
+    comments are never parsed as inline markup) are skipped. Problematic
+    nodes (short rawsource, unreliable alignment) and standalone hyperlinks
+    (recognized after the markup loop, so no ``^`` follows them; their
+    rawsource equals their text) are excluded.
     """
-    return frozenset(
-        item.end
-        for item in aligned
-        if item.kind != "problematic" and not (item.kind == "reference" and item.rawsource == item.visible_text)
+    alignable, _images = split_alignable_inlines(inlines)
+    counters.scan_chars += len(source)
+    comment_lines = [
+        (line_start, line_end)
+        for _, line_start, line_end in _line_bounds(source)
+        if _COMMENT_START_RE.match(source, line_start) and _is_comment_line_at(source, line_start)
+    ]
+    aligned, truncated_from_line = align_inlines_with_status(
+        source,
+        alignable,
+        counters=counters,
+        newlines=newlines,
+        skip_ranges=[*opaque, *comment_lines],
+    )
+    unknown_from = None
+    if truncated_from_line is not None:
+        unknown_from = 0 if truncated_from_line == 1 else newlines[truncated_from_line - 2] + 1
+    return _InlineEnds(
+        offsets=frozenset(
+            item.end
+            for item in aligned
+            if item.kind != "problematic" and not (item.kind == "reference" and item.rawsource == item.visible_text)
+        ),
+        unknown_from=unknown_from,
     )
 
 
@@ -720,7 +800,7 @@ def _enumerate_candidates(
     counters: OracleCounters,
     table_lines: frozenset[int],
     syntax_only: bool = False,
-    recognized_ends: frozenset[int] = frozenset(),
+    recognized_ends: _InlineEnds = _NO_INLINE_ENDS,
 ) -> list[_RawCandidate]:
     counters.scan_chars += len(source)
     owned_payloads = _role_owned_payload_spans(source)
@@ -754,7 +834,9 @@ def _enumerate_candidates(
         if form == "literal" and _literal_destroys_strong_or_emphasis(source, start, end):
             return
         # Shared-boundary mixed run (`x``-v``): equal-score → unsupported, not accepted.
-        if form == "literal" and is_shared_boundary_literal(source, start, end):
+        # The syntax-only rule still judges its boundaries, without a repair.
+        shared_boundary = form == "literal" and is_shared_boundary_literal(source, start, end)
+        if shared_boundary and not syntax_only:
             candidates.append(
                 _RawCandidate(
                     start=start,
@@ -794,7 +876,13 @@ def _enumerate_candidates(
             return
         if syntax_only:
             syntax_candidate = _syntax_only_candidate(
-                source, start, end, form=form, raw=raw, recognized_ends=recognized_ends
+                source,
+                start,
+                end,
+                form=form,
+                raw=raw,
+                recognized_ends=recognized_ends,
+                repairable=not shared_boundary,
             )
             if syntax_candidate is not None:
                 candidates.append(syntax_candidate)
@@ -1237,6 +1325,11 @@ def classify_document(source: str, *, syntax_only: bool = False) -> ConsumerView
     spans = aligned_to_spans(source, aligned, newlines=newlines)
     opaque = opaque_body_ranges(source, counters=counters)
     table_lines = _table_layout_line_starts(source)
+    recognized_ends = (
+        _recognized_inline_ends(source, oracle.inlines, opaque, counters=counters, newlines=newlines)
+        if syntax_only
+        else _NO_INLINE_ENDS
+    )
 
     oracle_strong: list[tuple[int, int]] = []
     for a in aligned:
@@ -1249,12 +1342,13 @@ def classify_document(source: str, *, syntax_only: bool = False) -> ConsumerView
         counters=counters,
         table_lines=table_lines,
         syntax_only=syntax_only,
-        recognized_ends=_recognized_inline_ends(aligned) if syntax_only else frozenset(),
+        recognized_ends=recognized_ends,
     )
     decisions: list[EditDecision] = []
     for raw in raw_candidates:
-        # Escaped / malformed gates
-        if raw.form == "interpreted" and "\\" in raw.raw:
+        # Escaped / malformed gates. The syntax-only rule judged the boundaries
+        # already; only an escaped end-string leaves the token unknown there.
+        if raw.form == "interpreted" and (_is_markup_escaped(source, raw.end - 1) if syntax_only else "\\" in raw.raw):
             decisions.append(
                 EditDecision(
                     candidate=RepairCandidate(

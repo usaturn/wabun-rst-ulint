@@ -384,12 +384,43 @@ def align_inlines_to_source(
     return aligned
 
 
+def split_alignable_inlines(
+    inlines: Sequence[OracleInline],
+) -> tuple[tuple[OracleInline, ...], tuple[OracleInline, ...]]:
+    """Split *inlines* into ``(alignable, images)``.
+
+    Neither of the separated kinds can be aligned in source order: an embedded
+    target's rawsource (the ``<uri>`` part with its leading space) lies inside
+    the reference aligned just before it, and an image's rawsource is its
+    directive text, repeated at every substitution reference. Embedded targets
+    are dropped; images are returned for consumers that still compare them.
+    """
+    alignable: list[OracleInline] = []
+    images: list[OracleInline] = []
+    previous: OracleInline | None = None
+    for item in inlines:
+        embedded_target = (
+            item.kind == "target"
+            and previous is not None
+            and previous.kind == "reference"
+            and bool(item.rawsource)
+            and item.rawsource in previous.rawsource
+        )
+        if item.kind == "image":
+            images.append(item)
+        elif not embedded_target:
+            alignable.append(item)
+        previous = item
+    return tuple(alignable), tuple(images)
+
+
 def align_inlines_with_status(
     source: str,
     inlines: Sequence[OracleInline],
     *,
     counters: OracleCounters | None = None,
     newlines: Sequence[int] | None = None,
+    skip_ranges: Sequence[tuple[int, int]] = (),
 ) -> tuple[list[AlignedInline], int | None]:
     """Align inlines and report where alignment stopped.
 
@@ -401,11 +432,15 @@ def align_inlines_with_status(
     Repeated identical rawsource is resolved by monotonic cursor advancement.
     Stops early when a rawsource cannot be found at/after the cursor (no
     arbitrary nearest/first-from-start fallback for remaining items).
+    A match starting inside *skip_ranges* (text docutils does not parse as
+    inline markup, e.g. literal blocks) is passed over; the default skips none.
     """
     if counters is not None:
         counters.scan_chars += len(source)
     if newlines is None:
         newlines = newline_offsets(source)
+    skips = _merge_ranges(list(skip_ranges))
+    skip_starts = [start for start, _ in skips]
     aligned: list[AlignedInline] = []
     cursor = 0
     for item in inlines:
@@ -413,6 +448,11 @@ def align_inlines_with_status(
         if not raw:
             return aligned, offset_to_line_column(source, cursor, newlines=newlines)[0]
         idx = source.find(raw, cursor)
+        while idx >= 0:
+            skip = bisect.bisect_right(skip_starts, idx) - 1
+            if skip < 0 or idx >= skips[skip][1]:
+                break
+            idx = source.find(raw, skips[skip][1])
         if idx < 0:
             return aligned, offset_to_line_column(source, cursor, newlines=newlines)[0]
         end = idx + len(raw)

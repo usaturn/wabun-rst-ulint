@@ -35,6 +35,7 @@ from wabun_rst_ulint.checkers._rst_oracle import (
     OracleInline,
     align_inlines_with_status,
     parse_document,
+    split_alignable_inlines,
 )
 from wabun_rst_ulint.reporting import Violation
 
@@ -176,23 +177,8 @@ def _inline_key(item: OracleInline | AlignedInline) -> InlineKey:
 def _inline_proof_inputs(
     inlines: tuple[OracleInline, ...],
 ) -> tuple[tuple[OracleInline, ...], tuple[InlineKey, ...]]:
-    alignable: list[OracleInline] = []
-    image_semantics: list[InlineKey] = []
-    previous: OracleInline | None = None
-    for item in inlines:
-        embedded_target = (
-            item.kind == "target"
-            and previous is not None
-            and previous.kind == "reference"
-            and bool(item.rawsource)
-            and item.rawsource in previous.rawsource
-        )
-        if item.kind == "image":
-            image_semantics.append(_inline_key(item))
-        elif not embedded_target:
-            alignable.append(item)
-        previous = item
-    return tuple(alignable), tuple(image_semantics)
+    alignable, images = split_alignable_inlines(inlines)
+    return alignable, tuple(_inline_key(item) for item in images)
 
 
 def _touches_ranges(
@@ -567,14 +553,34 @@ class ProofResult:
     reason: str | None = None
 
 
-def prove_combined_projection(baseline: DocumentFingerprint, projected: DocumentFingerprint) -> ProofResult:
+def _without_problematic(inlines: tuple[InlineKey, ...]) -> tuple[InlineKey, ...]:
+    return tuple(key for key in inlines if key[0] != "problematic")
+
+
+def prove_combined_projection(
+    baseline: DocumentFingerprint,
+    projected: DocumentFingerprint,
+    *,
+    ignore_problematic: bool = False,
+) -> ProofResult:
     """baseline/projected の untouched inline 列・block 列・message Counter を比較する純粋な証明関数。
 
     Safety transaction の (3)(4)(5)(6) に対応する。
+
+    ignore_problematic=True は、untouched inline の比較から problematic を除く
+    （syntax-only の修正用）。直さずに残す境界の problematic は rawsource が
+    バッククォート 1〜2 個と短く、baseline では手前の直す記法の未認識の
+    バッククォートへ整列して比較から外れ、projected では本来の位置に残るため。
+    problematic は必ず system message を伴うので、増えた場合は message の比較が拒否する。
     """
     if baseline.truncated_from_line is not None or projected.truncated_from_line is not None:
         return ProofResult(ok=False, reason="inline alignment truncated; cannot prove safety, failing closed")
-    if projected.untouched_inlines != baseline.untouched_inlines:
+    baseline_inlines = baseline.untouched_inlines
+    projected_inlines = projected.untouched_inlines
+    if ignore_problematic:
+        baseline_inlines = _without_problematic(baseline_inlines)
+        projected_inlines = _without_problematic(projected_inlines)
+    if projected_inlines != baseline_inlines:
         return ProofResult(
             ok=False,
             reason="untouched inline markup changed (payload/delimiter/adjacent node not preserved)",
@@ -658,7 +664,7 @@ def fix_document(source: str, *, syntax_only: bool = False) -> FixResult:
     拒否するので、書き込んだ後も report_only の判定は変わらない。
     """
     views = classify_document(source, syntax_only=syntax_only)  # parse #1（S2 の責務）
-    result = _fix_accepted(source, views)
+    result = _fix_accepted(source, views, syntax_only=syntax_only)
     if not syntax_only:
         return result
     remaining = tuple(
@@ -669,8 +675,12 @@ def fix_document(source: str, *, syntax_only: bool = False) -> FixResult:
     return replace(result, remaining=remaining)
 
 
-def _fix_accepted(source: str, views: ConsumerViews) -> FixResult:
-    """views の accepted decision を、安全確認を通してから source に適用する。"""
+def _fix_accepted(source: str, views: ConsumerViews, *, syntax_only: bool = False) -> FixResult:
+    """views の accepted decision を、安全確認を通してから source に適用する。
+
+    syntax_only=True では、report_only を書き換えずに残すので、combined projection
+    proof の untouched inline の比較から problematic を除く。
+    """
     accepted = accepted_decisions(views.inline.decisions)
     if not accepted:
         return FixResult(text=source, changed=False, violations=(), transaction_failure=False)
@@ -736,7 +746,7 @@ def _fix_accepted(source: str, views: ConsumerViews) -> FixResult:
         edit_ranges=plan.projected_effect_ranges,
         message_aliases=message_aliases,
     )  # S3 combined projection parse（最大2回のうち2回目）
-    proof = prove_combined_projection(baseline_fp, projected_fp)
+    proof = prove_combined_projection(baseline_fp, projected_fp, ignore_problematic=syntax_only)
     if not proof.ok:
         return FixResult(
             text=source,
