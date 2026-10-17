@@ -20,6 +20,13 @@ _EMBEDDED_LINK = "See `Example <https://example.com>`_.\n\n"
 _SUBSTITUTION_IMAGE = "See |logo| here.\n\n.. |logo| image:: logo.png\n\n"
 # 置換定義の中の記法は参照の位置にも同じ rawsource で現れ、対応付けがそこで止まる
 _TRUNCATING = ".. |name| replace:: :emphasis:`x`\n\nSee |name|.\n\n"
+# docutils が本文の記法を解析する directive。後の段落に同じ rawsource（``x``）が 2 回ある
+_PARSED_DIRECTIVE_BODIES = [
+    ".. list-table::\n\n   * - ``x``\n     - b\n\n",
+    ".. csv-table::\n\n   ``x``, b\n\n",
+    ".. figure:: logo.png\n\n   The ``x`` caption.\n\n",
+]
+_AFTER_SAME_RAWSOURCE = "see ``x`` then :ref:`z`:ref:`b` here.\n\nand ``x`` there.\n"
 
 # 開始記号の前だけが欠け、直前が文字・数字。--fix で空白を入れる（入力, 修正後）
 FIXABLE = [
@@ -73,6 +80,8 @@ RECOGNIZED_AFTER_PRECEDING_CONTENT = [
     _EMBEDDED_LINK + "The ``queue``:ref:`x` entry.\n",
     # 対応付けが止まった後は認識済みの終わりが分からないので、違反にしない
     _TRUNCATING + "see :ref:`a`:ref:`b`.\n",
+    # directive の本文の記法の位置が分からないので、その後の隣接記法は違反にしない
+    *[body + _AFTER_SAME_RAWSOURCE for body in _PARSED_DIRECTIVE_BODIES],
 ]
 
 # docutils が記法の境界と認識するので違反にしない

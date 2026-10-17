@@ -421,6 +421,7 @@ def align_inlines_with_status(
     counters: OracleCounters | None = None,
     newlines: Sequence[int] | None = None,
     skip_ranges: Sequence[tuple[int, int]] = (),
+    stop_ranges: Sequence[tuple[int, int]] = (),
 ) -> tuple[list[AlignedInline], int | None]:
     """Align inlines and report where alignment stopped.
 
@@ -432,8 +433,11 @@ def align_inlines_with_status(
     Repeated identical rawsource is resolved by monotonic cursor advancement.
     Stops early when a rawsource cannot be found at/after the cursor (no
     arbitrary nearest/first-from-start fallback for remaining items).
-    A match starting inside *skip_ranges* (text docutils does not parse as
-    inline markup, e.g. literal blocks) is passed over; the default skips none.
+    A match starting inside *skip_ranges* (text docutils never parses as
+    inline markup, e.g. comments) is passed over. A match starting inside
+    *stop_ranges* (text docutils may or may not parse, so the match may or may
+    not be the inline) stops the alignment there as if nothing were found.
+    Both default to no ranges.
     """
     if counters is not None:
         counters.scan_chars += len(source)
@@ -441,6 +445,8 @@ def align_inlines_with_status(
         newlines = newline_offsets(source)
     skips = _merge_ranges(list(skip_ranges))
     skip_starts = [start for start, _ in skips]
+    stops = _merge_ranges(list(stop_ranges))
+    stop_starts = [start for start, _ in stops]
     aligned: list[AlignedInline] = []
     cursor = 0
     for item in inlines:
@@ -453,7 +459,8 @@ def align_inlines_with_status(
             if skip < 0 or idx >= skips[skip][1]:
                 break
             idx = source.find(raw, skips[skip][1])
-        if idx < 0:
+        stop = bisect.bisect_right(stop_starts, idx) - 1
+        if idx < 0 or (stop >= 0 and idx < stops[stop][1]):
             return aligned, offset_to_line_column(source, cursor, newlines=newlines)[0]
         end = idx + len(raw)
         line, column = offset_to_line_column(source, idx, newlines=newlines)

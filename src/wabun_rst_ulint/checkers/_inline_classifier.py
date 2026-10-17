@@ -539,11 +539,14 @@ def _recognized_inline_ends(
 
     Aligned on their own so that earlier content cannot shift or stop them:
     embedded targets and images are left out (as in the fixer proof), and
-    matches inside opaque bodies and comment lines (literal blocks and
-    comments are never parsed as inline markup) are skipped. Problematic
-    nodes (short rawsource, unreliable alignment) and standalone hyperlinks
-    (recognized after the markup loop, so no ``^`` follows them; their
-    rawsource equals their text) are excluded.
+    matches on comment lines (never parsed as inline markup) are skipped. A
+    match inside an opaque body stops the alignment there, leaving the rest
+    unknown: such bodies include both text docutils never parses (literal
+    blocks, unknown directives) and text it does (``list-table`` cells,
+    ``figure`` captions), so skipping would shift a parsed inline onto a later
+    copy of its rawsource. Problematic nodes (short rawsource, unreliable
+    alignment) and standalone hyperlinks (recognized after the markup loop, so
+    no ``^`` follows them; their rawsource equals their text) are excluded.
     """
     alignable, _images = split_alignable_inlines(inlines)
     counters.scan_chars += len(source)
@@ -557,7 +560,8 @@ def _recognized_inline_ends(
         alignable,
         counters=counters,
         newlines=newlines,
-        skip_ranges=[*opaque, *comment_lines],
+        skip_ranges=comment_lines,
+        stop_ranges=opaque,
     )
     unknown_from = None
     if truncated_from_line is not None:
