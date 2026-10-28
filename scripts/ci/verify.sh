@@ -7,6 +7,23 @@ cd "$repo_root"
 profile="${1:-full}"
 quality_targets=(src tests)
 pyright_targets=(src)
+
+# Pyright must use the patched PATH runtime, not a bundled wheel or nodeenv.
+export PYRIGHT_PYTHON_NODEJS_WHEEL=0
+export PYRIGHT_PYTHON_GLOBAL_NODE=1
+if ! command -v node > /dev/null; then
+  printf 'Node.js 24.22.1 or later in the 24.x series is required on PATH.\n' >&2
+  exit 1
+fi
+node --input-type=commonjs <<'JS'
+const [major, minor, patch] = process.versions.node.split('.').map(Number);
+console.log(`Pyright Node.js: ${process.version} (${process.execPath})`);
+if (major !== 24 || minor < 22 || (minor === 22 && patch < 1)) {
+  console.error('Node.js 24.22.1 or later in the 24.x series is required (eMudhra CA fix).');
+  process.exit(1);
+}
+JS
+
 uv lock --check
 uv sync --locked --all-groups
 
