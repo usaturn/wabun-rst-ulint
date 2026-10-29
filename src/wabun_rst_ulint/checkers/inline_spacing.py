@@ -193,8 +193,9 @@ def _candidate_markup_range(source: str, start: int, end: int) -> tuple[int, int
     """accepted candidate の source_range から外側の境界空白を除いた範囲を返す。
 
     classifier が取り込んだ先頭の `\\ ` null escape も境界として除く。
-    null escape は既に前後の字句を分離しているため、その手前のバッククォートを
-    markup 本体に隣接する tick と誤認しない。探索は candidate の半開区間内に限る。
+    その手前のバッククォートは markup 本体に隣接しないが、修正は null escape を
+    半角スペースに置き換えるので、`_null_escape_breaks_recognized_inline` で別に
+    判定する。探索は candidate の半開区間内に限る。
     """
     while start < end:
         if source[start].isspace():
@@ -206,6 +207,30 @@ def _candidate_markup_range(source: str, start: int, end: int) -> tuple[int, int
     while end > start and source[end - 1].isspace():
         end -= 1
     return (start, end)
+
+
+def _null_escape_breaks_recognized_inline(
+    source: str,
+    start: int,
+    markup_start: int,
+    aligned_inline_ranges: tuple[AlignedInlineRange, ...],
+) -> bool:
+    """candidate 先頭の `\\ ` を半角スペースにすると、直前の tick を含む正常 inline が壊れるか。
+
+    baseline の正常 inline（problematic 以外）が `\\ ` の直前のバッククォートを含み、
+    `\\ ` をまたいで続く場合、置き換え後は開始記号の直後が空白になり、docutils は
+    その inline を認識しない。tick で終わる inline（終了記号）や、tick を含む正常
+    inline が無い場合は壊す inline が無い。
+    """
+    escape = source.find("\\ ", start, markup_start)
+    pos = escape - 1
+    return (
+        escape > 0
+        and source[pos] == "`"
+        and any(
+            inline_start <= pos and pos + 1 < inline_end for inline_start, inline_end, _kind in aligned_inline_ranges
+        )
+    )
 
 
 def _recognized_neighbor_owns_tick(
@@ -247,6 +272,10 @@ def _split_guard_rejections(
     problematic も metadata から除かれているので、`:ref:`a``b`` の stray tick や
     `` `a`_`b`_です `` の parse error artifact による分割は引き続き拒否する。
 
+    markup 範囲から除いた先頭の `\\ ` null escape も修正で半角スペースになるので、
+    その直前のバッククォートを含み `\\ ` をまたいで続く正常 inline があれば拒否する。
+    markup が空の null escape だけの candidate もこの判定は省かない。
+
     拒否した decision を除くと隣接関係（accepted-neighbor exemption）が変わる
     場合があるため、新たな拒否がなくなるまで同じ純粋判定を反復する。
     """
@@ -258,7 +287,11 @@ def _split_guard_rejections(
         markups = {index: _candidate_markup_range(source, *original_ranges[index]) for index in active}
         newly_rejected: list[tuple[int, int]] = []
         for index in sorted(active):
+            range_start = original_ranges[index][0]
             markup_start, markup_end = markups[index]
+            if _null_escape_breaks_recognized_inline(source, range_start, markup_start, aligned_inline_ranges):
+                newly_rejected.append((index, source.count("\n", 0, range_start) + 1))
+                continue
             if markup_start == markup_end:
                 continue
             for pos in (markup_start - 1, markup_end):

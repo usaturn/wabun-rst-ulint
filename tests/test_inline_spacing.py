@@ -534,6 +534,22 @@ class TestFixDocument:
         assert second.changed is False
         assert second.transaction_failure is False
 
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param("前 `\\ ``a``です` 後\n", id="literal-after-null-escape"),
+            pytest.param("`\\ ``:ref:`a`xです\n", id="null-escape-only"),
+        ],
+    )
+    def test_null_escape_edit_keeps_inline_opened_by_preceding_tick(self, source):
+        # `\ ` を半角スペースにすると、直前の tick を開始記号とする inline は認識されなくなる。
+        def normal_inlines(text):
+            return [(item.kind, item.rawsource) for item in parse_document(text).inlines if item.kind != "problematic"]
+
+        parent = next(key for key in normal_inlines(source) if "`\\ " in key[1])
+        result = inline_spacing.fix_document(source)
+        assert parent in normal_inlines(result.text)
+
     def test_forced_combined_proof_failure_no_write_diagnostic(self, monkeypatch):
         source = "値は``foo``です\n"
         real_parse = inline_spacing.parse_document
