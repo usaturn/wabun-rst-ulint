@@ -811,13 +811,14 @@ def _enumerate_candidates(
     # Account for the two role regex passes once (prefix + postfix)
     counters.scan_chars += len(source)
 
-    # Precompute bare interpreted candidates per line once
-    line_bare: dict[int, list[tuple[int, int]]] = {}
-    for m in SIMPLE_INTERP_RE.finditer(source):
-        start, end = m.start(), m.end()
-        line_start = source.rfind("\n", 0, start) + 1
-        line_bare.setdefault(line_start, []).append((start, end))
+    # Resolve physical-line metadata once, not by rescanning a dense line
+    # for each token. Other passes can visit candidates out of source order.
+    line_starts = [start for _, start, _ in _line_bounds(source)]
+    comment_lines = frozenset(start for start in line_starts if _is_comment_line_at(source, start))
     counters.scan_chars += len(source)
+
+    def line_start_at(offset: int) -> int:
+        return line_starts[bisect.bisect_right(line_starts, offset) - 1]
 
     mask = _occupied_mask(len(source), [])
     candidates: list[_RawCandidate] = []
@@ -828,7 +829,8 @@ def _enumerate_candidates(
             return
         if range_in_opaque(start, end, opaque):
             return
-        if _is_comment_line_at(source, start):
+        line_start = line_start_at(start)
+        if line_start in comment_lines:
             return
         if not _span_free(mask, start, end):
             return
@@ -856,7 +858,6 @@ def _enumerate_candidates(
             )
             return
         # Column-fixed simple/grid tables: never freeze boundary inserts as accepted.
-        line_start = source.rfind("\n", 0, start) + 1
         if line_start in table_lines:
             if syntax_only:
                 needs_repair = any(_syntax_boundary_faults(source, start, end, recognized_ends))
@@ -937,43 +938,37 @@ def _enumerate_candidates(
             continue
         claim(m.start(), m.end(), "ref_named" if m.group(2) == "_" else "ref_anonymous", m.group(0))
 
-    # 6. Interpreted text — unique-owned only (not equal-score chains)
+    # 6. Interpreted text — unique-owned only (not equal-score chains).
+    # Bare regex spans never overlap, so claiming one cannot mask another.
+    # Freeze eligibility after the higher-priority forms, preserving payload
+    # marking for the later null-escape pass even when a role regex missed.
+    interpreted: list[tuple[int, int]] = []
+    counters.scan_chars += len(source)
     for m in SIMPLE_INTERP_RE.finditer(source):
         start, end = m.start(), m.end()
         if not _span_free(mask, start, end):
             continue
         if range_in_opaque(start, end, opaque):
             continue
-        if _is_comment_line_at(source, start):
+        if line_start_at(start) in comment_lines:
             continue
-        # Never treat role/ref/target payloads as interpreted (even if mask missed)
         if _is_role_ref_or_target_payload(source, start, end, owned_payloads=owned_payloads):
             _mark(mask, start, end)
             continue
-        raw = m.group(0)
-        line_start = source.rfind("\n", 0, start) + 1
-        ambiguous_neighbor = False
-        for abs_s, abs_e in line_bare.get(line_start, ()):
-            if abs_s == start and abs_e == end:
-                continue
-            if range_in_opaque(abs_s, abs_e, opaque):
-                continue
-            if not _span_free(mask, abs_s, abs_e):
-                continue
-            if _is_role_ref_or_target_payload(source, abs_s, abs_e, owned_payloads=owned_payloads):
-                continue
-            if abs_e <= start:
-                gap = source[abs_e:start]
-            elif abs_s >= end:
-                gap = source[end:abs_s]
-            else:
-                continue
-            if gap and not any(ch.isspace() for ch in gap):
-                ambiguous_neighbor = True
-                break
-        if ambiguous_neighbor:
-            continue
-        claim(start, end, "interpreted", raw)
+        interpreted.append((start, end))
+
+    # Any farther eligible neighbor has the nearest neighbor inside its gap,
+    # so only consecutive pairs need checking. Their gaps are disjoint: the
+    # total scan is linear, including text inside excluded role/ref payloads.
+    # A newline is whitespace too and naturally separates physical lines.
+    ambiguous: set[int] = set()
+    for (left_start, left_end), (right_start, _) in zip(interpreted, interpreted[1:], strict=False):
+        gap = source[left_end:right_start]
+        if gap and not any(ch.isspace() for ch in gap):
+            ambiguous.update((left_start, right_start))
+    for start, end in interpreted:
+        if start not in ambiguous:
+            claim(start, end, "interpreted", source[start:end])
 
     # 7. Null-escape normalization not already covered (e.g. before valid role)
     # Passes 1-6 are done, so freeze their edit ranges into a mask: the old
@@ -990,7 +985,8 @@ def _enumerate_candidates(
             continue
         if range_in_opaque(start, end, opaque):
             continue
-        if _is_comment_line_at(source, start):
+        line_start = line_start_at(start)
+        if line_start in comment_lines:
             continue
         if start < len(edit_mask) and edit_mask[start]:
             continue
@@ -1007,7 +1003,7 @@ def _enumerate_candidates(
         # Column-fixed simple/grid tables: normalizing `\ ` (2 chars) to a single
         # ASCII space shrinks the cell by one column and breaks the table.
         # Same responsibility boundary as the `claim` path above.
-        if (source.rfind("\n", 0, start) + 1) in table_lines:
+        if line_start in table_lines:
             candidates.append(
                 _RawCandidate(
                     start=start,

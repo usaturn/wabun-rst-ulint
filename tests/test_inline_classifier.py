@@ -612,6 +612,34 @@ def _scaling_limit(strict: float) -> float:
     return strict + 0.7 if _CI else strict
 
 
+class TestInterpretedAdjacency:
+    def test_excluded_payload_whitespace_separates_neighbors(self) -> None:
+        # Filtering out a role/ref/target must not erase whitespace in its payload.
+        for middle in (":term:`i j`", "`i j`_", "_`i j`"):
+            source = f"値`a`間{middle}間`b`後\n"
+            views = classify_document(source)
+            interpreted = [
+                d.candidate.expected_rawsource.strip()
+                for d in views.inline.decisions
+                if d.candidate.form == "interpreted" and d.status == "accepted"
+            ]
+            assert interpreted == ["`a`", "`b`"], source
+
+    def test_neighbors_remain_ambiguous_through_excluded_payload(self) -> None:
+        for middle in (":term:`ij`", "`ij`_", "_`ij`", "`i j`"):
+            source = f"値`a`間{middle}間`b`後\n"
+            for syntax_only in (False, True):
+                views = classify_document(source, syntax_only=syntax_only)
+                assert not any(d.candidate.form == "interpreted" for d in views.inline.decisions), source
+
+    def test_unicode_whitespace_and_newline_separate_neighbors(self) -> None:
+        for separator in ("\u3000", "\u00a0", "\t", "\n"):
+            views = classify_document(f"値`a`後{separator}値`b`後\n")
+            assert (
+                sum(d.candidate.form == "interpreted" and d.status == "accepted" for d in views.inline.decisions) == 2
+            )
+
+
 class TestPerformanceCounters:
     def test_exactly_one_parse(self) -> None:
         classify_document("値は``foo``ですと 用語:term:`X`同期\n")
@@ -666,11 +694,12 @@ class TestPerformanceCounters:
         assert stats.parse_count == 1
         assert stats.scan_chars <= 64 * len(source)
 
-    def test_dense_scaling_not_cubic(self) -> None:
+    def test_dense_postfix_scaling_near_linear(self) -> None:
+        """Dense bare tokens must not rescan every same-line neighbor (Issue #10)."""
         import time
 
         def timed(n: int) -> float:
-            source = " ".join(["`x`"] * n) + "\n"
+            source = "`x`: " * n
             t0 = time.perf_counter()
             classify_document(source)
             return time.perf_counter() - t0
@@ -678,15 +707,12 @@ class TestPerformanceCounters:
         def best_of(n: int, samples: int = 3) -> float:
             return min(timed(n) for _ in range(samples))
 
-        # Warm-up: one classify so cold-start does not inflate t100 under suite load.
-        timed(50)
-        t100 = best_of(100)
-        t200 = best_of(200)
-        # Pre-fix ratio was ~6-8x when n doubled. Healthy is ~1.5-1.8x.
-        # Use min-of-3 timings to absorb parallel-suite scheduling noise.
-        if t100 > 0.005:
-            ratio = t200 / t100
-            assert ratio < _scaling_limit(3.5), f"scaling {t100:.4f} -> {t200:.4f} (ratio={ratio:.2f})"
+        timed(50)  # warm caches/imports before measuring
+        t400 = best_of(400)
+        t800 = best_of(800)
+        if t400 > 0.005:
+            ratio = t800 / t400
+            assert ratio < _scaling_limit(3.0), f"scaling {t400:.4f} -> {t800:.4f} (ratio={ratio:.2f})"
 
     def test_multiline_dense_decisions_scaling_near_linear(self) -> None:
         """Glued literals yield one accepted literal decision per line, so
@@ -717,8 +743,8 @@ class TestPerformanceCounters:
 
     def test_dense_postfix_probe_scaling_not_superlinear(self) -> None:
         """One `` `x`: `` per line isolates the `source[start:]` tail-copy fix
-        (review round2 OPUS-M3); the one-line-dense variant stays superlinear
-        due to the bare-interp adjacency loop, tracked in issue #23."""
+        (review round2 OPUS-M3). The same-line adjacency case is covered by
+        test_dense_postfix_scaling_near_linear (Issue #10)."""
         import time
 
         def timed(n: int) -> float:
@@ -735,7 +761,7 @@ class TestPerformanceCounters:
         t800 = best_of(800)
         # Pre-fix ratio measured 2.33-2.55x per doubling for this one-per-line
         # input on this hardware, so this test only guards against large
-        # regressions (the one-line-dense residual is tracked in issue #23).
+        # regressions; the same-line test guards adjacency separately.
         if t400 > 0.005:
             ratio = t800 / t400
             assert ratio < _scaling_limit(3.0), f"scaling {t400:.4f} -> {t800:.4f} (ratio={ratio:.2f})"
