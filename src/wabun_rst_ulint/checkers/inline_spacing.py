@@ -192,20 +192,45 @@ def _touches_ranges(
 def _candidate_markup_range(source: str, start: int, end: int) -> tuple[int, int]:
     """accepted candidate の source_range から外側の境界空白を除いた範囲を返す。
 
-    `_inline_classifier._expected_token_with_boundaries` は `\\ ` null escape を
-    飲み込むため source_range の先頭が `\\` から始まることがあるが、`\\` は
-    isspace() ではないためこのループでは剥がされず、先頭の null escape 接頭辞は
-    返り値の範囲に残ったままになる（例: `\\ ``a```）。これは意図した挙動であり
-    安全側にしか作用しない: null escape は既にその前後の字句を分離しているため、
-    直前に隣接するバッククォートが markup を分割することはあり得ず、
-    `_split_guard_rejections` はこのケースで fail-closed に倒れるだけである
-    （誤って書き込みを許可する方向には作用しない）。
+    classifier が取り込んだ先頭の `\\ ` null escape も境界として除く。
+    その手前のバッククォートは markup 本体に隣接しないが、修正は null escape を
+    半角スペースに置き換えるので、`_null_escape_breaks_recognized_inline` で別に
+    判定する。探索は candidate の半開区間内に限る。
     """
-    while start < end and source[start].isspace():
-        start += 1
+    while start < end:
+        if source[start].isspace():
+            start += 1
+        elif source.startswith("\\ ", start, end):
+            start += 2
+        else:
+            break
     while end > start and source[end - 1].isspace():
         end -= 1
     return (start, end)
+
+
+def _null_escape_breaks_recognized_inline(
+    source: str,
+    start: int,
+    markup_start: int,
+    aligned_inline_ranges: tuple[AlignedInlineRange, ...],
+) -> bool:
+    """candidate 先頭の `\\ ` を半角スペースにすると、直前の tick を含む正常 inline が壊れるか。
+
+    baseline の正常 inline（problematic 以外）が `\\ ` の直前のバッククォートを含み、
+    `\\ ` をまたいで続く場合、置き換え後は開始記号の直後が空白になり、docutils は
+    その inline を認識しない。tick で終わる inline（終了記号）や、tick を含む正常
+    inline が無い場合は壊す inline が無い。
+    """
+    escape = source.find("\\ ", start, markup_start)
+    pos = escape - 1
+    return (
+        escape > 0
+        and source[pos] == "`"
+        and any(
+            inline_start <= pos and pos + 1 < inline_end for inline_start, inline_end, _kind in aligned_inline_ranges
+        )
+    )
 
 
 def _recognized_neighbor_owns_tick(
@@ -235,31 +260,21 @@ def _split_guard_rejections(
     修復を拒否しないため）。アスタリスク系 markup は S4（Issue #12）の責務なので
     対象外。
 
-    exemption は意図的に「他の *active accepted* candidate の markup に属する」場合
-    だけに限定している。S2 は隣接するトークンを `overlapping-candidates` 理由で
-    unsupported に分類することがあり、そのトークンが字句として well-formed でも
-    markups（accepted のみ）には含まれないため exemption の対象にならない。
-    結果としてこのガードの発火は隣接トークン間の連結子に依存する
-    connector-dependent な挙動になる: half-width space や「と」のような連結子は
-    両側を独立に accepted へ倒すため発火しないが、全角空白 / タブ / NBSP /
-    `\\ ` null escape の連結子は隣接トークンを unsupported のまま残すため発火する。
-    exemption を unsupported/overlapping-candidates 側にも広げる案は S3 の
-    follow-up として認識しているが、別途 corpus 検証とレビューが必要なため
-    ここでは行わない。
+    他の active accepted candidate に加え、baseline parse で正常 inline
+    （problematic 以外）として認識された隣接記法にも exemption を認める。
+    その inline が隣接 tick を所有し、candidate の markup 境界ちょうどで
+    終端・開始することを baseline の align 結果で証明する。別の unsupported
+    decision と重なっていても、独立した隣接記法の所有関係は変わらない。
+    これにより全角空白や null escape による overlapping-candidates があっても
+    安全な accepted edit を適用できる（unsupported 自体は変更しない）。
 
-    さらに、baseline parse で独立に認識された正常 inline（problematic 以外）が
-    いずれの S2 decision（accepted/rejected/unsupported）の source_range とも
-    重ならず、かつ candidate の markup 範囲の境界ちょうどで終端・開始しており、
-    その inline が隣接バッククォートを所有する場合も exempt する
-    （例: ````a``:ref:`b`です``` の ````a`` ``）。所有関係は baseline の align
-    結果（aligned_inline_ranges）だけで証明し、decision の source_range や
-    candidate と重なる範囲、境界で接しない inline は対象外。baseline parse が
-    健全なノードと認識しても、connector-dependent な unsupported 隣接トークンは
-    unsupported decision の range と重なるため exemption にならず fail-closed の
-    ままである。problematic ノードも metadata から除外されているため、
-    `:ref:`a``b`` の stray tick や `` `a`_`b`_です `` の parse error artifact は
-    exemption にならない。decision と重なる baseline inline への exemption 拡張は
-    別途 corpus 検証とレビューが必要なためここでは行わない（S3 の follow-up）。
+    candidate を包む巨大な誤 parse や境界に接しない inline は免除しない。
+    problematic も metadata から除かれているので、`:ref:`a``b`` の stray tick や
+    `` `a`_`b`_です `` の parse error artifact による分割は引き続き拒否する。
+
+    markup 範囲から除いた先頭の `\\ ` null escape も修正で半角スペースになるので、
+    その直前のバッククォートを含み `\\ ` をまたいで続く正常 inline があれば拒否する。
+    markup が空の null escape だけの candidate もこの判定は省かない。
 
     拒否した decision を除くと隣接関係（accepted-neighbor exemption）が変わる
     場合があるため、新たな拒否がなくなるまで同じ純粋判定を反復する。
@@ -272,7 +287,13 @@ def _split_guard_rejections(
         markups = {index: _candidate_markup_range(source, *original_ranges[index]) for index in active}
         newly_rejected: list[tuple[int, int]] = []
         for index in sorted(active):
+            range_start = original_ranges[index][0]
             markup_start, markup_end = markups[index]
+            if _null_escape_breaks_recognized_inline(source, range_start, markup_start, aligned_inline_ranges):
+                newly_rejected.append((index, source.count("\n", 0, range_start) + 1))
+                continue
+            if markup_start == markup_end:
+                continue
             for pos in (markup_start - 1, markup_end):
                 owned_by_accepted_neighbor = any(
                     start <= pos < end for neighbor_index, (start, end) in markups.items() if neighbor_index != index
@@ -280,8 +301,7 @@ def _split_guard_rejections(
                 if (
                     0 <= pos < len(source)
                     and source[pos] == "`"
-                    # accepted candidate の markup にのみ属す場合を exempt する
-                    # （unsupported/overlapping-candidates の隣接トークンは対象外）。
+                    # 他の active accepted candidate の markup 所有による免除。
                     and not owned_by_accepted_neighbor
                     # baseline で独立に認識された正常 inline が候補境界ちょうどで
                     # 終端・開始しており、隣接 tick を所有する場合も exempt。
@@ -693,19 +713,9 @@ def _fix_accepted(source: str, views: ConsumerViews, *, syntax_only: bool = Fals
     baseline_oracle = parse_document(source)  # S3 baseline parse（最大2回のうち1回目）
     baseline_meta = _document_fingerprint_from_oracle(source, baseline_oracle)
 
-    # split guard の exemption 対象は、いずれの S2 decision（accepted/rejected/
-    # unsupported）の source_range とも重なりのない独立した baseline inline だけ。
-    # baseline parse が健全と認識しても decision と重なる inline（例:
-    # connector-dependent な unsupported 隣接トークン）は除外し fail-closed を保つ。
-    decision_ranges = tuple(
-        (decision.candidate.source_range.start, decision.candidate.source_range.end)
-        for decision in views.inline.decisions
-    )
-    recognized_neighbors = tuple(
-        item for item in baseline_meta.aligned_inline_ranges if not _touches_ranges(item[0], item[1], decision_ranges)
-    )
-
-    rejections = _split_guard_rejections(source, original_ranges, recognized_neighbors)
+    # 正常 baseline inline が候補境界ちょうどで隣接 tick を所有するかは guard 内で
+    # 判定する。他の decision との重なりだけを理由に正常な隣接記法を除外しない。
+    rejections = _split_guard_rejections(source, original_ranges, baseline_meta.aligned_inline_ranges)
     safe = tuple(decision for index, decision in enumerate(ordered) if index not in rejections)
     if not safe:
         guard_line = min(rejections.values())

@@ -51,6 +51,38 @@ class TestMessageNormalization:
         )
 
 
+class TestSplitGuardBoundaries:
+    @pytest.mark.parametrize(
+        ("source", "start", "end", "expected"),
+        [
+            ("`", 0, 0, (0, 0)),
+            ("` \t`", 1, 3, (3, 3)),
+            ("``a``", 0, 5, (0, 5)),
+            ("\t\\ ``a``　", 0, 9, (3, 8)),
+            ("\\ ", 0, 2, (2, 2)),
+        ],
+    )
+    def test_markup_range_excludes_leading_boundary(self, source, start, end, expected):
+        assert inline_spacing._candidate_markup_range(source, start, end) == expected
+
+    @pytest.mark.parametrize(
+        ("source", "ranges", "neighbors", "expected"),
+        [
+            ("`", ((0, 0),), (), {}),
+            ("` \t`", ((1, 3),), (), {}),
+            ("``a``", ((0, 5),), (), {}),
+            ("`a``b`", ((0, 3), (3, 6)), (), {}),
+            ("前\n\n:ref:`a``b`\n", ((3, 11),), (), {0: 3}),
+            ("``a``:ref:`b`", ((5, 13),), ((0, 5, "literal"),), {}),
+            (":ref:`a```b``", ((0, 8),), ((8, 13, "literal"),), {}),
+            ("``a``:ref:`b`", ((5, 13),), ((0, 13, "literal"),), {0: 1}),
+            ("``a``:ref:`b`", ((5, 13),), ((0, 6, "literal"),), {0: 1}),
+        ],
+    )
+    def test_probes_only_nonempty_markup_and_exact_neighbor_boundaries(self, source, ranges, neighbors, expected):
+        assert inline_spacing._split_guard_rejections(source, ranges, neighbors) == expected
+
+
 class TestDocumentFingerprint:
     def test_blocks_exclude_system_message_and_its_descendants(self):
         # baseline: docutils が problematic ノード + system_message を生成するケース。
@@ -462,17 +494,15 @@ class TestFixDocument:
         ("source", "expected"),
         [
             pytest.param(
-                # 全角空白連結: 中間2トークンは unsupported のまま。末尾 accepted は
-                # split-risk で除外され、先頭の独立した safe decision だけが適用される。
+                # 中間の unsupported は変更せず、両端の accepted を修正する。
                 ":ref:`a`:ref:`b`　:ref:`a`:ref:`b`\n",
-                ":ref:`a` :ref:`b`　:ref:`a`:ref:`b`\n",
-                id="ideographic-space-connector-partial",
+                ":ref:`a` :ref:`b`　:ref:`a` :ref:`b`\n",
+                id="ideographic-space-connector-repaired",
             ),
             pytest.param(
-                # null escape 連結: 同上（safe だけ適用、split-risk は除外）。
                 ":ref:`a`:ref:`b`\\ :ref:`a`:ref:`b`\n",
-                ":ref:`a` :ref:`b`\\ :ref:`a`:ref:`b`\n",
-                id="null-escape-connector-partial",
+                ":ref:`a` :ref:`b`\\ :ref:`a` :ref:`b`\n",
+                id="null-escape-connector-repaired",
             ),
             pytest.param(
                 ":ref:`a`:ref:`b`と:ref:`a`:ref:`b`\n",
@@ -486,28 +516,39 @@ class TestFixDocument:
             ),
         ],
     )
-    def test_split_guard_outcome_is_connector_dependent(self, source, expected):
-        """PR #27 final review F1 + Task 2: split guard の exemption は accepted
-        candidate の markup にしか適用されず、S2 が unsupported
-        (`overlapping-candidates`) に分類した well-formed な隣接トークンは exempt
-        されない。そのため隣接する 4トークンを同じ連結子で結んでも、連結子の種類
-        次第で結果が変わる。
-
-        半角空白や「と」の連結子では両側が accepted に倒れるためガードは発火せず
-        4トークンとも修正される。全角空白 / `\\ ` null escape の連結子では中間が
-        unsupported のまま残り、末尾 accepted は split-risk として decision 単位で
-        除外される一方、先頭の独立した safe decision は Task 2 により引き続き適用
-        される（batch 全体の fail-closed にはしない）。
-
-        これは受け入れ済みの既知の制限を固定するテストであり、望ましい仕様として
-        pin しているわけではない。exemption を unsupported 側にも広げる変更を
-        行う場合は、この対比が意図的に壊されたことを自覚した上で更新すること
-        （S3 の follow-up: 別途 corpus 検証とレビューが必要）。
-        """
+    def test_split_guard_allows_recognized_neighbors_across_connectors(self, source, expected):
+        """正常な隣接記法は、別の unsupported decision と重なっていても免除する。"""
         result = inline_spacing.fix_document(source)
         assert result.changed is True
         assert result.transaction_failure is False
         assert result.text == expected
+
+    def test_split_guard_skips_leading_null_escape_before_literal(self):
+        source = "値は`\\ ``a``です\n"
+        result = inline_spacing.fix_document(source)
+        assert result.text == "値は` ``a`` です\n"
+        assert result.changed is True
+        assert result.transaction_failure is False
+        second = inline_spacing.fix_document(result.text)
+        assert second.text == result.text
+        assert second.changed is False
+        assert second.transaction_failure is False
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            pytest.param("前 `\\ ``a``です` 後\n", id="literal-after-null-escape"),
+            pytest.param("`\\ ``:ref:`a`xです\n", id="null-escape-only"),
+        ],
+    )
+    def test_null_escape_edit_keeps_inline_opened_by_preceding_tick(self, source):
+        # `\ ` を半角スペースにすると、直前の tick を開始記号とする inline は認識されなくなる。
+        def normal_inlines(text):
+            return [(item.kind, item.rawsource) for item in parse_document(text).inlines if item.kind != "problematic"]
+
+        parent = next(key for key in normal_inlines(source) if "`\\ " in key[1])
+        result = inline_spacing.fix_document(source)
+        assert parent in normal_inlines(result.text)
 
     def test_forced_combined_proof_failure_no_write_diagnostic(self, monkeypatch):
         source = "値は``foo``です\n"
